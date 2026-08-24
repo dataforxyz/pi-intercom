@@ -16,6 +16,7 @@ interface StoredWorker {
   role?: unknown;
   state?: unknown;
   owned?: unknown;
+  managerOwner?: unknown;
   managerSessionId?: unknown;
   intercomTarget?: unknown;
   workerIncarnationId?: unknown;
@@ -95,6 +96,14 @@ function workerIncarnation(worker: StoredWorker): string | undefined {
   return stringValue(worker.workerIncarnationId) ?? stringValue(worker.runId);
 }
 
+function workerManagerSessionId(worker: StoredWorker): string | undefined {
+  if (Object.prototype.hasOwnProperty.call(worker, "managerOwner")) {
+    if (!worker.managerOwner || typeof worker.managerOwner !== "object" || Array.isArray(worker.managerOwner)) return undefined;
+    return stringValue((worker.managerOwner as Record<string, unknown>).sessionId);
+  }
+  return stringValue(worker.managerSessionId);
+}
+
 function teamMember(worker: StoredWorker, sessions: TeamSession[]): TeamMember | undefined {
   const id = stringValue(worker.id);
   if (!id) return undefined;
@@ -142,7 +151,7 @@ export async function resolveIntercomTeam(input: {
     const managerTarget = parent
       ? stringValue(parent.intercomTarget) ?? stringValue(parent.id)
       : currentHierarchy.depth === 0
-        ? stringValue(current.managerSessionId) ?? stringValue(env.AGENT_INTERCOM_MANAGER_TARGET) ?? stringValue(env.AGENT_INTERCOM_MANAGER_SESSION_ID)
+        ? workerManagerSessionId(current) ?? stringValue(env.AGENT_INTERCOM_MANAGER_TARGET) ?? stringValue(env.AGENT_INTERCOM_MANAGER_SESSION_ID)
         : undefined;
     const coworkers = workers
       .filter((worker) => worker.owned === true && LIVE_STATES.has(stringValue(worker.state) ?? ""))
@@ -158,13 +167,14 @@ export async function resolveIntercomTeam(input: {
     };
   }
 
-  // Legacy stores have no durable hierarchy. Preserve the original manager-session projection.
-  const managerTarget = stringValue(current?.managerSessionId) ?? stringValue(env.AGENT_INTERCOM_MANAGER_TARGET) ?? stringValue(env.AGENT_INTERCOM_MANAGER_SESSION_ID);
+  // Project ordinary workers and top-level managers by canonical v4 ownership,
+  // while preserving managerSessionId for legacy stores that predate managerOwner.
+  const managerTarget = (current ? workerManagerSessionId(current) : undefined) ?? stringValue(env.AGENT_INTERCOM_MANAGER_TARGET) ?? stringValue(env.AGENT_INTERCOM_MANAGER_SESSION_ID);
   const teamId = managerTarget ?? input.selfId;
   const isManager = !managerTarget;
   const coworkers = workers
     .filter((worker) => worker.owned === true)
-    .filter((worker) => stringValue(worker.managerSessionId) === teamId)
+    .filter((worker) => workerManagerSessionId(worker) === teamId)
     .filter((worker) => LIVE_STATES.has(stringValue(worker.state) ?? ""))
     .filter((worker) => stringValue(worker.id) !== workerId)
     .map((worker) => teamMember(worker, input.sessions))
