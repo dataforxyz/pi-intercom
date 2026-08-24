@@ -6,6 +6,19 @@ import test from "node:test";
 import { formatIntercomTeam, resolveIntercomTeam, resolveManagedInboxSession } from "./team.ts";
 
 const worker = (id: string, runId: string, managerSessionId: string, state = "ready") => ({ id, runId, harness: "pi", role: "reviewer", state, owned: true, managerSessionId, intercomTarget: id });
+const managerOwner = (sessionId: string) => ({ context: "pi", principalId: sessionId, sessionId, bindingEpoch: 0 });
+const v4RootWorker = (id: string, incarnation: string, ownerSessionId: string, state = "ready") => ({
+  id,
+  runId: incarnation,
+  workerIncarnationId: incarnation,
+  harness: "pi",
+  role: "reviewer",
+  state,
+  owned: true,
+  managerOwner: managerOwner(ownerSessionId),
+  intercomTarget: id,
+  hierarchy: { rootWorkerIncarnationId: incarnation, depth: 0 },
+});
 
 test("intercom team resolves the current manager and live coworkers after adoption", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "intercom-team-"));
@@ -22,6 +35,85 @@ test("intercom team resolves the current manager and live coworkers after adopti
     const adopted = await resolveIntercomTeam({ selfId: "self", agentDir, env: { AGENT_INTERCOM_WORKER_ID: "self", AGENT_INTERCOM_RUN_ID: "run-self", AGENT_INTERCOM_MANAGER_SESSION_ID: "manager-a" }, sessions: [{ id: "manager-b" }, { id: "other" }] });
     assert.deepEqual(adopted.manager, { target: "manager-b", connected: true });
     assert.deepEqual(adopted.coworkers.map((entry) => entry.id), ["other"]);
+  } finally { await rm(agentDir, { recursive: true, force: true }); }
+});
+
+test("v4 managerOwner projects live root workers for their top-level manager", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "intercom-v4-manager-owner-"));
+  const storeDir = join(agentDir, "intercom", "orchestrator");
+  await mkdir(storeDir, { recursive: true });
+  try {
+    await writeFile(join(storeDir, "workers.json"), JSON.stringify({ version: 4, workers: [
+      { ...v4RootWorker("ready", "ready-inc", "manager-a"), managerSessionId: "stale-manager" },
+      v4RootWorker("working", "working-inc", "manager-a", "working"),
+      v4RootWorker("stopped", "stopped-inc", "manager-a", "stopped"),
+      v4RootWorker("other", "other-inc", "manager-b"),
+      { ...v4RootWorker("malformed", "malformed-inc", "manager-a"), managerOwner: null, managerSessionId: "manager-a" },
+    ] }));
+
+    const team = await resolveIntercomTeam({
+      selfId: "manager-a",
+      agentDir,
+      env: {},
+      sessions: [{ id: "ready" }, { id: "working" }],
+    });
+
+    assert.deepEqual(team.manager, { target: "manager-a", connected: true });
+    assert.deepEqual(team.self, { id: "manager-a", isManager: true });
+    assert.deepEqual(team.coworkers.map(({ id, connected }) => ({ id, connected })), [
+      { id: "ready", connected: true },
+      { id: "working", connected: true },
+    ]);
+    assert.doesNotMatch(formatIntercomTeam(team), /Coworkers: none/);
+  } finally { await rm(agentDir, { recursive: true, force: true }); }
+});
+
+test("v4 managerOwner follows ordinary worker adoption instead of stale environment ownership", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "intercom-v4-adoption-"));
+  const storeDir = join(agentDir, "intercom", "orchestrator");
+  await mkdir(storeDir, { recursive: true });
+  const env = { AGENT_INTERCOM_WORKER_ID: "self", AGENT_INTERCOM_RUN_ID: "self-inc", AGENT_INTERCOM_MANAGER_SESSION_ID: "stale-manager" };
+  try {
+    await writeFile(join(storeDir, "workers.json"), JSON.stringify({ version: 4, workers: [
+      v4RootWorker("self", "self-inc", "manager-a"),
+      v4RootWorker("sibling", "sibling-inc", "manager-a"),
+      v4RootWorker("other", "other-inc", "manager-b"),
+    ] }));
+    const first = await resolveIntercomTeam({ selfId: "self", agentDir, env, sessions: [{ id: "manager-a" }, { id: "sibling" }] });
+    assert.deepEqual(first.manager, { target: "manager-a", connected: true });
+    assert.deepEqual(first.coworkers.map((entry) => entry.id), ["sibling"]);
+
+    await writeFile(join(storeDir, "workers.json"), JSON.stringify({ version: 4, workers: [
+      v4RootWorker("self", "self-inc", "manager-b"),
+      v4RootWorker("other", "other-inc", "manager-b"),
+    ] }));
+    const adopted = await resolveIntercomTeam({ selfId: "self", agentDir, env, sessions: [{ id: "manager-b" }, { id: "other" }] });
+    assert.deepEqual(adopted.manager, { target: "manager-b", connected: true });
+    assert.deepEqual(adopted.coworkers.map((entry) => entry.id), ["other"]);
+  } finally { await rm(agentDir, { recursive: true, force: true }); }
+});
+
+test("v4 root delegated manager resolves its controller from managerOwner before stale environment fallback", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "intercom-v4-root-manager-"));
+  const storeDir = join(agentDir, "intercom", "orchestrator");
+  await mkdir(storeDir, { recursive: true });
+  try {
+    const self = { ...v4RootWorker("self", "self-inc", "controller"), delegationGrant: { grantId: "active-grant" } };
+    const child = {
+      ...v4RootWorker("child", "child-inc", "self-target"),
+      hierarchy: { rootWorkerIncarnationId: "self-inc", parentWorkerIncarnationId: "self-inc", depth: 1 },
+    };
+    await writeFile(join(storeDir, "workers.json"), JSON.stringify({ version: 4, workers: [self, child] }));
+
+    const team = await resolveIntercomTeam({
+      selfId: "self-target",
+      agentDir,
+      env: { AGENT_INTERCOM_WORKER_ID: "self", AGENT_INTERCOM_RUN_ID: "self-inc", AGENT_INTERCOM_MANAGER_SESSION_ID: "stale-controller" },
+      sessions: [{ id: "controller" }, { id: "child" }],
+    });
+
+    assert.deepEqual(team.manager, { target: "controller", connected: true });
+    assert.deepEqual(team.coworkers.map((entry) => entry.id), ["child"]);
   } finally { await rm(agentDir, { recursive: true, force: true }); }
 });
 
